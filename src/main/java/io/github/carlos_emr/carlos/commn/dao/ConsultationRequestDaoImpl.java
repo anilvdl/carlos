@@ -31,9 +31,14 @@
 
 package io.github.carlos_emr.carlos.commn.dao;
 
+import jakarta.persistence.LockModeType;
+
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Date;
 import java.util.List;
+import java.util.Locale;
+import java.util.Objects;
 
 import jakarta.persistence.Query;
 import jakarta.persistence.TypedQuery;
@@ -50,15 +55,25 @@ import org.hibernate.query.criteria.JpaEntityJoin;
 import org.hibernate.query.criteria.JpaRoot;
 
 import io.github.carlos_emr.carlos.commn.NativeSql;
-import io.github.carlos_emr.carlos.commn.model.ConsultationRequest;
 import io.github.carlos_emr.carlos.commn.model.ConsultationServices;
 import io.github.carlos_emr.carlos.commn.model.Demographic;
 import io.github.carlos_emr.carlos.commn.model.ProfessionalSpecialist;
 import io.github.carlos_emr.carlos.commn.model.Provider;
+import io.github.carlos_emr.carlos.commn.model.ConsultationRequest;
+import io.github.carlos_emr.carlos.consultation.dto.ConsultantOptionDto;
+import io.github.carlos_emr.carlos.consultation.dto.ConsultationListFilterDto;
+import io.github.carlos_emr.carlos.consultation.dto.ConsultationMrpOptionDto;
 import io.github.carlos_emr.carlos.consultation.dto.ConsultationRequestListItemDTO;
 
 @SuppressWarnings("unchecked")
 public class ConsultationRequestDaoImpl extends AbstractDaoImpl<ConsultationRequest> implements ConsultationRequestDao {
+
+    /**
+     * Name tokens honoured by {@link #searchDistinctConsultants(String, int)}. A person's name has
+     * at most a handful of parts; the cap keeps a pasted paragraph from producing an unbounded
+     * number of LIKE predicates.
+     */
+    static final int MAX_CONSULTANT_SEARCH_TOKENS = 4;
 
     public ConsultationRequestDaoImpl() {
         super(ConsultationRequest.class);
@@ -80,8 +95,23 @@ public class ConsultationRequestDaoImpl extends AbstractDaoImpl<ConsultationRequ
     }
 
     public List<ConsultationRequest> getConsults(Integer demoNo) {
-        StringBuilder sql = new StringBuilder("select cr from ConsultationRequest cr, Demographic d, Provider p where d.demographicNo = cr.demographicId and p.providerNo = cr.providerNo and cr.demographicId = ?1");
-        Query query = entityManager.createQuery(sql.toString());
+        // A consultation request belongs to the PATIENT and must appear in the
+        // patient's chart regardless of the state of the ordering provider's record.
+        // The previous query cross-joined Demographic AND Provider purely as existence
+        // filters (neither table is projected), so a consult whose providerNo was null
+        // or referenced a provider row that no longer exists was silently dropped from
+        // the Consultations tab. The demographic constraint (cr.demographicId = ?1)
+        // already scopes the result to this patient, and the caller
+        // (EctViewConsultationRequestsUtil) null-tolerantly re-resolves the provider
+        // and demographic per row, so select on the demographic alone.
+        //
+        // That null-tolerance is a CONTRACT this query depends on, not an incidental
+        // detail: dropping the joins is what lets rows with a dangling demographic or
+        // provider reach the caller, and the caller shares one try/catch across its
+        // whole loop, so a single unguarded dereference there blanks the entire
+        // Consultations tab rather than degrading one row.
+        Query query = entityManager.createQuery(
+                "select cr from ConsultationRequest cr left join fetch cr.professionalSpecialist where cr.demographicId = ?1");
         query.setParameter(1, demoNo);
 
         List<ConsultationRequest> results = query.getResultList();
@@ -89,33 +119,38 @@ public class ConsultationRequestDaoImpl extends AbstractDaoImpl<ConsultationRequ
     }
 
 
-    /**
-     * Queries consultation requests for the consult list view, applying the optional team, status
-     * and date filters and the legacy order-by / pagination contract. The query LEFT-joins the
-     * specialist association plus the demographic, provider and service rows so the optional
-     * ORDER BY columns are available, and binds every filter value as a Criteria parameter.
-     *
-     * @param team          {@code sendTo} value to match exactly; {@code null} or empty skips the team filter
-     * @param showCompleted when {@code false}, rows with status {@code "4"} (and NULL status) are excluded
-     * @param startDate     inclusive lower bound on the searched date column (see {@code searchDate}), or {@code null} for none
-     * @param endDate       inclusive upper bound on the searched date column (see {@code searchDate}), or {@code null} for none
-     * @param orderby       legacy sort token {@code "1"}-{@code "9"}; {@code null} or an unknown token falls back to referral date descending
-     * @param desc          primary sort direction; {@code "1"} sorts descending, any other value ascending
-     * @param searchDate    {@code "1"} filters on {@code appointmentDate}, any other value filters on {@code referralDate}
-     * @param offset        zero-based index of the first row to return; {@code null} starts at {@code 0}
-     * @param limit         maximum rows to return; {@code null} uses {@link ConsultationRequestDao#DEFAULT_CONSULT_REQUEST_RESULTS_LIMIT}, capped at the maximum list return size
-     * @return the matching consultation requests in the requested order, never {@code null}
-     * @since 2026-06-18
-     */
     public List<ConsultationRequest> getConsults(String team, boolean showCompleted, Date startDate, Date endDate, String orderby, String desc, String searchDate, Integer offset, Integer limit) {
+        return getConsults(new ConsultationListFilterDto(team, showCompleted, startDate, endDate, orderby, desc,
+                searchDate, offset, limit, null, null));
+    }
+
+    @Override
+    public List<ConsultationRequest> getConsults(ConsultationListFilterDto filter) {
+        Objects.requireNonNull(filter, "filter");
+        if ((filter.visibleProviderNos() != null && filter.visibleProviderNos().isEmpty())
+                || (filter.visibleSiteNames() != null && filter.visibleSiteNames().isEmpty())) {
+            return List.of();
+        }
+        String team = filter.team();
+        boolean showCompleted = filter.showCompleted();
+        Date startDate = filter.startDate();
+        Date endDate = filter.endDate();
+        String orderby = filter.orderby();
+        String desc = filter.desc();
+        String searchDate = filter.searchDate();
+        Integer offset = filter.offset();
+        Integer limit = filter.limit();
+        Integer consultantId = filter.consultantId();
+        String mrpProviderNo = filter.mrpProviderNo() == null ? null : filter.mrpProviderNo().trim();
+        boolean filterByMrp = mrpProviderNo != null && !mrpProviderNo.isEmpty();
 
         CriteriaBuilder cb = entityManager.getCriteriaBuilder();
         CriteriaQuery<ConsultationRequest> cq = cb.createQuery(ConsultationRequest.class);
         JpaRoot<ConsultationRequest> cr = (JpaRoot<ConsultationRequest>) cq.from(ConsultationRequest.class);
 
-        // professionalSpecialist is a mapped @ManyToOne association: clean LEFT association join.
+        // Fetch the optional specialist, as the list reads its name after the query.
         Join<ConsultationRequest, ProfessionalSpecialist> specialist =
-                cr.join("professionalSpecialist", JoinType.LEFT);
+                (Join<ConsultationRequest, ProfessionalSpecialist>) cr.<ConsultationRequest, ProfessionalSpecialist>fetch("professionalSpecialist", JoinType.LEFT);
 
         // ConsultationServices, Demographic and Provider are NOT mapped associations on
         // ConsultationRequest (the columns are raw FK scalars). They are reproduced as Hibernate
@@ -136,6 +171,20 @@ public class ConsultationRequestDaoImpl extends AbstractDaoImpl<ConsultationRequ
         provider.on(cb.equal(demographic.get("providerNo"), provider.get("providerNo")));
 
         List<Predicate> predicates = new ArrayList<>();
+
+        // Visibility is applied before pagination, including its lookahead row.
+        if (filter.visibleProviderNos() != null) {
+            predicates.add(provider.get("providerNo").in(filter.visibleProviderNos()));
+        }
+        if (filter.visibleSiteNames() != null) {
+            predicates.add(cr.get("siteName").in(filter.visibleSiteNames()));
+        }
+        if (consultantId != null) {
+            predicates.add(cb.equal(specialist.get("id"), consultantId));
+        }
+        if (filterByMrp) {
+            predicates.add(cb.equal(demographic.get("providerNo"), mrpProviderNo));
+        }
 
         if (!showCompleted) {
             // NULL-excluding, exactly like the legacy "cr.status != '4'": rows with NULL status
@@ -162,7 +211,11 @@ public class ConsultationRequestDaoImpl extends AbstractDaoImpl<ConsultationRequ
         }
 
         cq.select(cr).where(predicates.toArray(new Predicate[0]));
-        cq.orderBy(buildConsultsOrder(cb, cr, specialist, service, demographic, provider, orderby, desc));
+        List<Order> orders = new ArrayList<>(buildConsultsOrder(
+                cb, cr, specialist, service, demographic, provider, orderby, desc));
+        // A stable final key prevents tied names/dates from moving between pages.
+        orders.add(cb.asc(cr.get("id")));
+        cq.orderBy(orders);
 
         TypedQuery<ConsultationRequest> query = entityManager.createQuery(cq);
         query.setFirstResult(offset != null ? offset : 0);
@@ -323,4 +376,100 @@ public class ConsultationRequestDaoImpl extends AbstractDaoImpl<ConsultationRequ
         query.setParameter("demoId", demographicId);
         return query.getResultList();
     }
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Only specialists referenced by a consultation request are returned (an {@code EXISTS}
+     * on {@code consultationRequests.specId}), so a large specialist directory does not flood the
+     * suggestions with people nobody has referred to. Every token is bound as a parameter with
+     * {@code !} as the LIKE escape character; the number of predicates depends only on the token
+     * count, never on the token text.</p>
+     */
+    @Override
+    public List<ConsultantOptionDto> searchDistinctConsultants(String keyword, int maxResults) {
+        List<String> tokens = tokenizeConsultantKeyword(keyword);
+        if (tokens.isEmpty() || maxResults < 1) {
+            return Collections.emptyList();
+        }
+
+        StringBuilder jpql = new StringBuilder("""
+                SELECT NEW io.github.carlos_emr.carlos.consultation.dto.ConsultantOptionDto(
+                    s.id, s.lastName, s.firstName)
+                FROM ProfessionalSpecialist s
+                WHERE EXISTS (SELECT 1 FROM ConsultationRequest cr WHERE cr.professionalSpecialist.id = s.id)
+                """);
+        for (int i = 0; i < tokens.size(); i++) {
+            jpql.append(" AND LOWER(CONCAT(COALESCE(s.lastName, ''), ', ', COALESCE(s.firstName, ''))) LIKE :term")
+                    .append(i)
+                    .append(" ESCAPE '!'");
+        }
+        jpql.append(" ORDER BY s.lastName, s.firstName, s.id");
+
+        Query query = entityManager.createQuery(jpql.toString());
+        for (int i = 0; i < tokens.size(); i++) {
+            query.setParameter("term" + i, "%" + escapeLikeLiteral(tokens.get(i)) + "%");
+        }
+        query.setMaxResults(Math.min(maxResults, MAX_LIST_RETURN_SIZE));
+        return query.getResultList();
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Projects only the provider number and name; the dropdown never needs the full
+     * {@code Provider} entity. A provider row that no longer exists is simply absent.</p>
+     */
+    @Override
+    public List<ConsultationMrpOptionDto> findDistinctConsultMrps() {
+        Query query = entityManager.createQuery("""
+                SELECT NEW io.github.carlos_emr.carlos.consultation.dto.ConsultationMrpOptionDto(
+                    p.providerNo, p.lastName, p.firstName)
+                FROM Provider p
+                WHERE EXISTS (
+                    SELECT 1 FROM ConsultationRequest cr, Demographic d
+                    WHERE d.demographicNo = cr.demographicId AND d.providerNo = p.providerNo)
+                ORDER BY p.lastName, p.firstName, p.providerNo
+                """);
+        return query.getResultList();
+    }
+
+    /**
+     * Splits a consultant keyword on whitespace and commas into lower-case tokens
+     * ({@link Locale#ROOT}, so the result does not depend on the server locale).
+     *
+     * @param keyword String the raw keyword; may be null
+     * @return at most {@link #MAX_CONSULTANT_SEARCH_TOKENS} non-empty tokens
+     */
+    static List<String> tokenizeConsultantKeyword(String keyword) {
+        List<String> tokens = new ArrayList<>();
+        if (keyword == null) {
+            return tokens;
+        }
+        for (String part : keyword.toLowerCase(Locale.ROOT).split("[\\s,]+")) {
+            if (!part.isEmpty()) {
+                tokens.add(part);
+                if (tokens.size() == MAX_CONSULTANT_SEARCH_TOKENS) {
+                    break;
+                }
+            }
+        }
+        return tokens;
+    }
+
+    /**
+     * Escapes the LIKE metacharacters so user text is matched literally under {@code ESCAPE '!'}.
+     * The escape character itself is escaped first.
+     *
+     * @param value String the token to escape; not null
+     * @return the escaped token
+     */
+    static String escapeLikeLiteral(String value) {
+        return value.replace("!", "!!").replace("%", "!%").replace("_", "!_");
+    }
+
+    @Override
+    public ConsultationRequest lockForAttachmentSync(Integer id) {
+        return entityManager.find(ConsultationRequest.class, id, LockModeType.PESSIMISTIC_WRITE);
+    }
+
 }
